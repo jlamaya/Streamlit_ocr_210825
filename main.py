@@ -1,105 +1,109 @@
 import os
 import io
-from typing import Tuple
+from typing import List, Tuple
 
 import streamlit as st
-from PIL import Image
-import numpy as np
-import cv2  # OpenCV (headless)
-import pytesseract
 from groq import Groq
+from PIL import Image, ImageOps
+import easyocr
+import numpy as np
 
 # ---------------------------
-# Configuración de la página
+# Config de página
 # ---------------------------
 st.set_page_config(
-    page_title="OCR + Groq (versión alternativa)",
+    page_title="OCR + Groq (Streamlit Cloud friendly)",
     page_icon="🧩",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 # ---------------------------
 # Utilidades
 # ---------------------------
 
+@st.cache_resource
+def load_easyocr_reader(langs: List[str]):
+    # Forzamos CPU para compatibilidad en Streamlit Cloud
+    return easyocr.Reader(langs, gpu=False)
+
 def ensure_groq() -> Groq:
-    """
-    Obtiene el cliente de Groq tomando la API key de la barra lateral
-    o de la variable de entorno GROQ_API_KEY.
-    """
     key = st.session_state.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY")
     if not key:
-        st.warning("Falta GROQ_API_KEY (ponla en la barra lateral).")
+        st.error("Falta GROQ_API_KEY. Ingresa tu key en la barra lateral.")
         st.stop()
     return Groq(api_key=key)
 
-def preprocess_image(pil_img: Image.Image) -> np.ndarray:
+def normalize_image(pil_img: Image.Image) -> Image.Image:
     """
-    Preprocesamiento suave para mejorar el OCR:
-    - A escala de grises
-    - Filtro bilateral (reduce ruido conservando bordes)
-    - Umbral adaptativo
-    - Apertura morfológica ligera
-    Devuelve una imagen binaria (numpy array) lista para Tesseract.
+    Pequeño preprocesamiento:
+    - Convertir a RGB
+    - AutoOrient (EXIF) para corregir rotaciones
+    - Aumentar contraste moderadamente
     """
-    img = np.array(pil_img.convert("RGB"))
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    denoise = cv2.bilateralFilter(gray, d=7, sigmaColor=50, sigmaSpace=50)
-    thr = cv2.adaptiveThreshold(
-        denoise, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10
-    )
-    kernel = np.ones((2, 2), np.uint8)
-    opened = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
-    return opened
+    img = pil_img.convert("RGB")
+    img = ImageOps.exif_transpose(img)
+    # Opcional: convertir a escala de grises para EasyOCR no suele ser necesario
+    return img
 
-def ocr_with_tesseract(pil_img: Image.Image, lang: str = "spa+eng") -> str:
+def easyocr_extract_text(pil_img: Image.Image, reader: easyocr.Reader) -> Tuple[str, list]:
     """
-    Aplica preprocesamiento y extrae texto con Tesseract.
+    Devuelve texto unido y resultados crudos (lista de [bbox, text, conf]).
     """
-    processed = preprocess_image(pil_img)
-    # Para depurar: mostrar procesado en el panel izquierdo si se desea
-    text = pytesseract.image_to_string(processed, lang=lang)
-    return text.strip()
+    arr = np.array(pil_img)
+    result = reader.readtext(arr)
+    texto = " ".join([r[1] for r in result]).strip()
+    return texto, result
 
-def call_groq_summarize(text: str, model: str = "llama-3.1-8b-instant") -> str:
+def call_groq(text: str, mode: str, model: str, temperature: float = 0.2) -> str:
     """
-    Envía el texto OCR a Groq para:
-    - corregir errores obvios de OCR
-    - resumir / analizar
+    Envía a Groq el texto OCR para:
+    - Resumen
+    - Análisis/organización de datos
+    - Q&A si detecta pregunta
     """
     if not text:
         return "No se detectó texto en la imagen."
     client = ensure_groq()
 
-    prompt = f"""
-Eres un asistente que analiza texto obtenido por OCR.
-1) Corrige solamente errores evidentes de OCR.
-2) Resume en 5-8 viñetas claras (sin inventar).
-3) Si el texto es una pregunta, respóndela brevemente.
-4) Si son datos, organízalos en una lista.
+    if mode == "Resumen":
+        prompt = f"""Eres un asistente que analiza texto obtenido por OCR.
+1) Corrige solo errores evidentes de OCR.
+2) Resume en 5–8 viñetas claras, sin inventar.
 
 TEXTO OCR:
 ---
 {text}
 ---
 
-Ahora, responde:
-"""
+Ahora responde con viñetas:"""
+    else:  # "Analizar / Organizar"
+        prompt = f"""Del siguiente texto extraído por OCR:
+- Corrige errores evidentes.
+- Si son datos, organízalos en una tabla de Markdown o lista estructurada.
+- Si es una pregunta, respóndela brevemente.
+- Si es un texto largo, resume puntos clave.
+
+TEXTO:
+---
+{text}
+---
+
+Responde:"""
+
     resp = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
+        temperature=temperature,
     )
     return resp.choices[0].message.content.strip()
 
 # ---------------------------
-# Interfaz
+# UI
 # ---------------------------
 
-st.title("🧩 OCR + Groq (implementación alternativa)")
-st.caption("Versión distinta que usa Tesseract + OpenCV en lugar de EasyOCR.")
+st.title("🧩 OCR + Groq (compatible con Streamlit Cloud)")
+st.caption("Usa EasyOCR (sin binarios del sistema) y Groq para resumir/analizar el texto extraído.")
 
 with st.sidebar:
     st.header("🔑 Configuración")
@@ -107,61 +111,62 @@ with st.sidebar:
     if api_key:
         st.session_state["GROQ_API_KEY"] = api_key
 
-    st.markdown("—")
     st.subheader("🛠️ Opciones")
-    lang = st.text_input("Idioma OCR (Tesseract)", value="spa+eng", help="Ej.: 'spa', 'eng', 'spa+eng'")
+    langs_str = st.text_input("Idiomas OCR (EasyOCR)", value="es,en", help="Separados por coma. Ej: es,en")
+    langs = [s.strip() for s in langs_str.split(",") if s.strip()]
+    mode = st.radio("Modo", ["Resumen", "Analizar / Organizar"], index=0)
     model = st.selectbox("Modelo Groq", ["llama-3.1-8b-instant", "llama-3.1-70b-versatile"], index=0)
+    temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
 
 col1, col2 = st.columns([1, 1], gap="large")
 
 with col1:
     st.subheader("🖼️ Sube tu imagen")
-    uploaded = st.file_uploader("PNG / JPG / JPEG", type=["png", "jpg", "jpeg"], label_visibility="collapsed")
+    up = st.file_uploader("PNG/JPG/JPEG", type=["png", "jpg", "jpeg"], label_visibility="collapsed")
+    if up:
+        img = Image.open(up)
+        st.image(img, caption="Imagen cargada", use_column_width=True)
 
-    if uploaded is not None:
-        pil_img = Image.open(uploaded).convert("RGB")
-        st.image(pil_img, caption="Imagen cargada", use_column_width=True)
+        if st.button("✨ Ejecutar OCR + Groq", type="primary", use_container_width=True):
+            # Cargar OCR (cacheado)
+            try:
+                reader = load_easyocr_reader(langs if langs else ["es", "en"])
+            except Exception as e:
+                st.error(f"No se pudo cargar EasyOCR: {e}")
+                st.stop()
 
-        # Vista del preprocesado (opcional)
-        if st.toggle("Mostrar imagen preprocesada (para depurar OCR)", value=False):
-            proc = preprocess_image(pil_img)
-            st.image(proc, caption="Preprocesada", use_column_width=True, clamp=True)
-
-        if st.button("✨ Extraer texto y analizar con Groq", type="primary", use_container_width=True):
-            with st.spinner("🔍 Aplicando OCR..."):
-                text = ocr_with_tesseract(pil_img, lang=lang)
+            with st.spinner("🔍 Extrayendo texto (EasyOCR)…"):
+                img_norm = normalize_image(img)
+                text, raw = easyocr_extract_text(img_norm, reader)
                 st.session_state["ocr_text"] = text
+                st.session_state["ocr_raw"] = raw
 
-            with st.spinner("🧠 Consultando Groq..."):
-                analysis = call_groq_summarize(text, model=model)
-                st.session_state["groq_answer"] = analysis
+            with st.spinner("🧠 Analizando con Groq…"):
+                out = call_groq(text, mode=mode, model=model, temperature=temperature)
+                st.session_state["groq_out"] = out
 
 with col2:
     st.subheader("💡 Resultados")
     if "ocr_text" in st.session_state:
-        with st.expander("Texto extraído (OCR)"):
+        with st.expander("Texto OCR"):
             st.text_area("Texto", st.session_state["ocr_text"], height=180)
         st.download_button(
-            "⬇️ Descargar texto OCR",
+            "⬇️ Descargar OCR",
             data=st.session_state["ocr_text"],
             file_name="ocr.txt",
             mime="text/plain",
             use_container_width=True
         )
 
-    if "groq_answer" in st.session_state:
-        st.markdown("#### Resumen / Análisis (Groq)")
-        st.write(st.session_state["groq_answer"])
+    if "groq_out" in st.session_state:
+        st.markdown("#### Salida de Groq")
+        st.write(st.session_state["groq_out"])
         st.download_button(
-            "⬇️ Descargar análisis",
-            data=st.session_state["groq_answer"],
-            file_name="analisis_groq.txt",
+            "⬇️ Descargar salida Groq",
+            data=st.session_state["groq_out"],
+            file_name="groq_out.txt",
             mime="text/plain",
             use_container_width=True
         )
 
-st.info(
-    "Nota: Para usar Tesseract debes tenerlo instalado en el sistema. "
-    "En Ubuntu: `sudo apt-get install tesseract-ocr tesseract-ocr-spa`. "
-    "En macOS: `brew install tesseract`. En Windows: instala el binario y agrega al PATH."
-)
+st.info("Sugerencia: si el OCR sale pobre, intenta con imágenes más nítidas (300–400 DPI) y revisa los idiomas configurados.")
